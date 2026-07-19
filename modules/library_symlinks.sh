@@ -467,6 +467,40 @@ show_library_menu() {
     echo -e -n "${BLUE}请选择 [0-5]: ${NC}"
 }
 
+# 获取或确认外部存储路径
+ensure_external_path() {
+    local default_external="$1"
+    local external_path_var="$2"  # 变量名引用
+
+    # 如果已经设置过，直接返回
+    local current_value="${!external_path_var}"
+    if [ -n "$current_value" ]; then
+        return 0
+    fi
+
+    echo ""
+    echo -e "${YELLOW}请指定外部存储路径${NC}"
+    echo -e "建议使用: ${CYAN}$default_external${NC}"
+    echo -n -e "${BLUE}回车使用默认，或输入自定义路径: ${NC}"
+    read -r input_path
+
+    if [ -z "$input_path" ]; then
+        input_path="$default_external"
+    fi
+
+    # 检查外部存储是否可用
+    local mount_point=$(echo "$input_path" | cut -d/ -f1-3)
+    if [ ! -d "$mount_point" ]; then
+        log_error "外部存储设备未挂载: $mount_point"
+        log_info "请先连接外置硬盘后重试"
+        return 1
+    fi
+
+    # 通过间接赋值更新上层变量
+    eval "$external_path_var=\"$input_path\""
+    return 0
+}
+
 # 主入口
 configure_library_symlinks() {
     # 只在 macOS 上运行
@@ -475,34 +509,14 @@ configure_library_symlinks() {
         return 1
     fi
 
-    # 默认外部存储路径
     local default_external="$LIB_DEFAULT_EXTERNAL"
     local external_path=""
 
-    # 检查外部盘
-    echo ""
-    echo -e "${YELLOW}请指定外部存储路径${NC}"
-    echo -e "建议使用: ${CYAN}$default_external${NC}"
-    echo -n -e "${BLUE}回车使用默认，或输入自定义路径: ${NC}"
-    read -r input_path
-
-    if [ -z "$input_path" ]; then
-        external_path="$default_external"
-    else
-        external_path="$input_path"
-    fi
-
-    # 检查外部存储是否可用
-    local mount_point=$(echo "$external_path" | cut -d/ -f1-3)
-    if [ ! -d "$mount_point" ]; then
-        log_error "外部存储设备未挂载: $mount_point"
-        log_info "请先连接外置硬盘"
-        return 1
-    fi
-
-    # 主循环
+    # 主循环 —— 先显示菜单，必要时再问路径
     while true; do
-        show_library_menu "$external_path"
+        # 初始路径未知时用默认值预显示状态表
+        local display_path="${external_path:-$default_external}"
+        show_library_menu "$display_path"
         read -r choice
 
         case $choice in
@@ -511,6 +525,10 @@ configure_library_symlinks() {
                 break
                 ;;
             1)
+                # 迁移需要路径
+                if [ -z "$external_path" ]; then
+                    ensure_external_path "$default_external" external_path || continue
+                fi
                 echo ""
                 log_info "将迁移以下目录到: $external_path"
                 echo ""
@@ -535,6 +553,10 @@ configure_library_symlinks() {
                 wait_for_key "按任意键继续..."
                 ;;
             4)
+                # 恢复需要路径
+                if [ -z "$external_path" ]; then
+                    ensure_external_path "$default_external" external_path || continue
+                fi
                 echo ""
                 if confirm_action "确认将已迁移的目录恢复回系统盘 (此操作将复制数据回来)"; then
                     restore_library_symlinks "$external_path"
@@ -542,6 +564,10 @@ configure_library_symlinks() {
                 wait_for_key "按任意键继续..."
                 ;;
             5)
+                # launchd 监控需要路径
+                if [ -z "$external_path" ]; then
+                    ensure_external_path "$default_external" external_path || continue
+                fi
                 setup_launchd_watcher "$external_path"
                 wait_for_key "按任意键继续..."
                 ;;
