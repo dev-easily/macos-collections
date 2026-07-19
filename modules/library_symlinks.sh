@@ -213,47 +213,217 @@ quick_cleanup() {
 }
 
 # ============================================================
-# 扫描未列出的 >1G 大目录
+# 智能扫描 + 迁移（不局限于预设列表）
 # ============================================================
 
-scan_large_directories() {
-    echo -e "\n${YELLOW}扫描 ~/Library 中 >1G 的大目录...${NC}"
-    echo ""
-
-    local tmpfile=$(mktemp)
-    du -sk "$HOME/Library"/*/ 2>/dev/null | sort -rn | while read size path; do
-        if [ "$size" -gt 1048576 ]; then  # >1G in KiB
-            local size_hr=$(echo "scale=1; $size / 1024 / 1024" | bc)
-            local name=$(basename "$path")
-            printf "  ${CYAN}%-30s${NC} %s Gi\n" "$name" "$size_hr"
+# 检查路径或其任意父级是否为软链接（判断是否已迁移）
+path_has_symlink_ancestor() {
+    local p="$1"
+    while [ "$p" != "$HOME/Library" ] && [ "$p" != "$HOME" ] && [ "$p" != "/" ]; do
+        if [ -L "$p" ]; then
+            return 0
         fi
-    done > "$tmpfile"
+        p="$(dirname "$p")"
+    done
+    return 1
+}
 
-    if [ -s "$tmpfile" ]; then
-        cat "$tmpfile"
-    fi
+# 扫描 ~/Library 下的大目录（真实目录，非已迁移的软链接）
+# 参数: 阈值(KiB)，默认 300MiB = 307200KiB
+# 输出: 找到的目录列表到 stdout，每行: "size_kib path"
+scan_library_dirs() {
+    local min_size_kib="${1:-307200}"  # 默认 300MiB
+    local tempfile
 
-    # 也扫描两级深度的
-    echo ""
-    echo -e "${YELLOW}深层扫描 (Application Support, Containers, Developer 子目录)...${NC}"
-    for sub in "Application Support" Containers Developer; do
+    tempfile=$(mktemp)
+
+    # 1) 扫描 ~/Library 一级子目录
+    du -sk "$HOME/Library"/*/ 2>/dev/null >> "$tempfile"
+
+    # 2) 扫描二级目录：Application Support, Containers, Developer, Caches 的子目录
+    for sub in "Application Support" Containers Developer/CoreSimulator Caches; do
         local base="$HOME/Library/$sub"
-        if [ -d "$base" ]; then
-            du -sk "$base"/*/ 2>/dev/null | sort -rn | while read size path; do
-                if [ "$size" -gt 1048576 ]; then
-                    local size_hr=$(echo "scale=1; $size / 1024 / 1024" | bc)
-                    local name=$(basename "$path")
-                    printf "  ${CYAN}%-30s${NC} %s Gi  (%s)\n" "$sub/$name" "$size_hr" "$path"
-                fi
-            done
-        fi
-    done > "$tmpfile"
+        [ -d "$base" ] && du -sk "$base"/*/ 2>/dev/null >> "$tempfile"
+    done
 
-    if [ -s "$tmpfile" ]; then
-        cat "$tmpfile"
+    # 3) 扫描三级目录：Application Support 下有一些更深的重要目录
+    for sub in "Application Support"/*/; do
+        [ -d "$sub" ] && du -sk "$sub"*/ 2>/dev/null >> "$tempfile"
+    done
+
+    # 过滤：>= 阈值 且 是真实目录（不是已迁移的软链接）
+    while read -r size path; do
+        # 过滤无限大的空行
+        [ -z "$size" ] || [ -z "$path" ] && continue
+        [ "$size" -lt "$min_size_kib" ] && continue
+
+        # 去掉尾部斜杠（du 从 glob 带斜杠进来，会干扰 -L 检测）
+        path="${path%/}"
+        # 跳过已迁移的父子目录链（软链接及其子树）
+        if path_has_symlink_ancestor "$path"; then
+            continue
+        fi
+
+        # 跳过已知的系统级目录（不应该整体迁移）
+        local rel="${path#$HOME/Library/}"
+        case "/$rel/" in
+            /Containers/|/Application\ Support/|/Developer/|/Caches/|/Metadata/|/Group\ Containers/|/Logs/|/WebKit/)
+                continue
+                ;;
+        esac
+
+        # 跳过深度过大的奇怪路径
+        local depth=$(echo "$path" | tr '/' '\n' | wc -l | tr -d ' ')
+        [ "$depth" -gt 10 ] && continue
+
+        echo "$size $path"
+    done < "$tempfile" | sort -rn -k1
+
+    rm -f "$tempfile"
+}
+
+# 显示扫描结果，让用户选择并迁移
+smart_scan_and_migrate() {
+    local external_path="$1"
+
+    echo ""
+    echo -e "${YELLOW}╔══════════════════════════════════════════════════════════════╗${NC}"
+    echo -e "${YELLOW}║              智能扫描 — 不局限固定列表                      ║${NC}"
+    echo -e "${YELLOW}╚══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "扫描 ${CYAN}~/Library${NC} 及子目录中 > ${CYAN}300 MiB${NC} 的目录（排除已迁移的软链接）..."
+    echo ""
+
+    local min_size_kib=$((300 * 1024))  # 300 MiB
+    local results=()
+    local result_sizes=()
+    local result_paths=()
+
+    # 执行扫描
+    while IFS=' ' read -r size path; do
+        [ -z "$size" ] || [ -z "$path" ] && continue
+        # 跳过已经以软链接存在的预设列表目录
+        results+=("$size $path")
+        result_sizes+=("$size")
+        result_paths+=("$path")
+    done < <(scan_library_dirs "$min_size_kib")
+
+    local count=${#results[@]}
+
+    if [ "$count" -eq 0 ]; then
+        log_success "没有找到超过 300 MiB 的待迁移目录！"
+        echo ""
+        log_info "你的系统盘存储状态很好，无需额外迁移。"
+        return 0
     fi
 
-    rm -f "$tmpfile"
+    # 显示扫描结果表
+    echo -e "${CYAN}发现 $count 个可迁移的大目录:${NC}"
+    echo ""
+    printf "  ${YELLOW}%3s  %-12s  %-45s  %s${NC}\n" "#" "大小" "路径" "相对 ~/Library/"
+    printf "  ${YELLOW}%3s  %-12s  %-45s  %s${NC}\n" "---" "----------" "---" "-------------"
+
+    local total_savable=0
+    local idx=1
+    for item in "${results[@]}"; do
+        local size=$(echo "$item" | cut -d' ' -f1)
+        local path=$(echo "$item" | cut -d' ' -f2-)
+        local rel_path="${path#$HOME/Library/}"
+        local size_hr=$(echo "scale=1; $size / 1024 / 1024" | bc 2>/dev/null)
+        printf "  ${CYAN}%2d)${NC} %7s Gi  %s\n" "$idx" "$size_hr" "$rel_path"
+        total_savable=$((total_savable + size))
+        idx=$((idx + 1))
+    done
+
+    local total_hr=$(echo "scale=1; $total_savable / 1024 / 1024" | bc 2>/dev/null)
+    echo ""
+    echo -e "预计可节省: ${GREEN}${total_hr} Gi${NC}"
+    echo ""
+
+    # 让用户选择迁移哪些
+    echo "选择要迁移的目录（迁移后会在原始位置创建软链接指向外置盘）:"
+    echo "  • 输入序号迁移单个: 1"
+    echo "  • 输入范围迁移多个: 1-5"
+    echo "  • 输入 all 迁移全部"
+    echo "  • 输入 q 取消"
+    echo ""
+    echo -n -e "${BLUE}你的选择: ${NC}"
+    read -r selection
+
+    [ -z "$selection" ] && selection="q"
+
+    # 解析选择
+    local selected_indices=()
+
+    if [ "$selection" = "all" ]; then
+        for ((i = 1; i <= count; i++)); do
+            selected_indices+=("$i")
+        done
+    elif [ "$selection" = "q" ]; then
+        log_info "已取消"
+        return 0
+    elif [[ "$selection" =~ ^[0-9]+$ ]]; then
+        # 单个数字
+        if [ "$selection" -ge 1 ] && [ "$selection" -le "$count" ]; then
+            selected_indices+=("$selection")
+        else
+            log_error "无效序号: $selection (有效范围: 1-$count)"
+            return 1
+        fi
+    elif [[ "$selection" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+        # 范围: 1-5
+        local start="${BASH_REMATCH[1]}"
+        local end="${BASH_REMATCH[2]}"
+        if [ "$start" -ge 1 ] && [ "$end" -le "$count" ] && [ "$start" -le "$end" ]; then
+            for ((i = start; i <= end; i++)); do
+                selected_indices+=("$i")
+            done
+        else
+            log_error "无效范围: $selection (有效范围: 1-$count)"
+            return 1
+        fi
+    else
+        log_error "无效输入，已取消"
+        return 1
+    fi
+
+    # 确认并迁移
+    echo ""
+    echo -e "${YELLOW}将迁移以下 ${#selected_indices[@]} 个目录:${NC}"
+    for idx in "${selected_indices[@]}"; do
+        local path="${result_paths[$((idx - 1))]}"
+        local rel="${path#$HOME/Library/}"
+        local size=$(echo "scale=1; ${result_sizes[$((idx - 1))]} / 1024 / 1024" | bc 2>/dev/null)
+        echo "  • ${rel} (${size} Gi)"
+    done
+    echo ""
+
+    if ! confirm_action "确认迁移"; then
+        log_info "已取消"
+        return 0
+    fi
+
+    # 执行迁移
+    local migrated=0 failed=0
+    for idx in "${selected_indices[@]}"; do
+        local path="${result_paths[$((idx - 1))]}"
+        local rel="${path#$HOME/Library/}"
+        local label=$(echo "$rel" | tr '/' '-')
+
+        echo ""
+        log_info "迁移: $rel"
+
+        if create_dev_symlink "$rel" "$path" "$external_path"; then
+            log_success "✓ $rel 迁移完成"
+            migrated=$((migrated + 1))
+        else
+            log_error "✗ $rel 迁移失败"
+            failed=$((failed + 1))
+        fi
+    done
+
+    echo ""
+    log_success "智能扫描迁移完成: $migrated 成功, $failed 失败"
 }
 
 # ============================================================
@@ -457,8 +627,8 @@ show_library_menu() {
 
     echo ""
     echo "操作选项:"
-    echo "  1. 开始迁移 - 将上述目录移到外部存储并创建软链接"
-    echo "  2. 扫描未列出的大目录 (>1G)"
+    echo "  1. 开始迁移 - 将预设列表中的目录移到外部存储（使用中请先迁移预设目录）"
+    echo "  2. 智能扫描 - 扫描 ~/Library 下所有 >300MiB 目录，选择迁移"
     echo "  3. 一键清理 - 安全清除缓存/废纸篓等临时文件"
     echo "  4. 恢复迁移 - 将软链接目录恢复回系统盘"
     echo "  5. 配置启动监控 - 防止外置盘未挂载时软链接被覆盖"
@@ -545,7 +715,11 @@ configure_library_symlinks() {
                 wait_for_key "按任意键继续..."
                 ;;
             2)
-                scan_large_directories
+                # 智能扫描需要路径
+                if [ -z "$external_path" ]; then
+                    ensure_external_path "$default_external" external_path || continue
+                fi
+                smart_scan_and_migrate "$external_path"
                 wait_for_key "按任意键继续..."
                 ;;
             3)
