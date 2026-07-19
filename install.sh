@@ -107,10 +107,11 @@ setup_mirrors() {
 show_preset_menu() {
     echo -e "\n${YELLOW}选择安装模式:${NC}"
     echo "1. 配置开发目录 - 将缓存和工具目录链接到外部存储 (推荐先运行)"
-    echo "2. 完整安装 - 安装所有可用组件"
-    echo "3. 自定义安装 - 手动选择组件"
+    echo "2. 配置系统存储 - 将~/Library大目录迁移到外置硬盘"
+    echo "3. 完整安装 - 安装所有可用组件"
+    echo "4. 自定义安装 - 手动选择组件"
     echo "0. 退出"
-    echo -n -e "\n${BLUE}请选择 [0-3]: ${NC}"
+    echo -n -e "\n${BLUE}请选择 [0-4]: ${NC}"
 }
 
 # 显示组件菜单
@@ -398,11 +399,20 @@ main() {
                 configure_dev_directory
                 ;;
             2)
+                # 导入Library存储迁移模块
+                if [ -f "$MODULES_DIR/library_symlinks.sh" ]; then
+                    source "$MODULES_DIR/library_symlinks.sh"
+                    configure_library_symlinks
+                else
+                    log_error "存储迁移模块不存在: $MODULES_DIR/library_symlinks.sh"
+                fi
+                ;;
+            3)
                 if confirm_action "确认安装 完整安装"; then
                     install_preset "complete"
                 fi
                 ;;
-            3)
+            4)
                 custom_install
                 ;;
             *)
